@@ -158,10 +158,16 @@ constexpr uint8_t epps = ENCODER_PULSES_PER_STEP;
     #include "../feature/power_monitor.h"
   #endif
 
-#if SCREENS_CAN_TIME_OUT
-  bool MarlinUI::defer_return_to_status;
-  millis_t MarlinUI::return_to_status_ms = 0;
-#endif
+  #if HAS_ENCODER_ACTION
+    volatile uint8_t MarlinUI::buttons;
+    #if HAS_SLOW_BUTTONS
+      volatile uint8_t MarlinUI::slow_buttons;
+    #endif
+    #if HAS_TOUCH_BUTTONS
+      #include "touch/touch_buttons.h"
+      bool MarlinUI::on_edit_screen = false;
+    #endif
+  #endif
 
   #if SCREENS_CAN_TIME_OUT
     bool MarlinUI::defer_return_to_status;
@@ -808,8 +814,8 @@ constexpr uint8_t epps = ENCODER_PULSES_PER_STEP;
    * This function is only called from the main thread.
    */
 
-LCDViewAction MarlinUI::lcdDrawUpdate = LCDVIEW_CLEAR_CALL_REDRAW;
-millis_t next_lcd_update_ms;
+  LCDViewAction MarlinUI::lcdDrawUpdate = LCDVIEW_CLEAR_CALL_REDRAW;
+  millis_t next_lcd_update_ms;
 
   inline bool can_encode() {
     return !BUTTON_PRESSED(ENC_EN); // Update encoder only when ENC_EN is not LOW (pressed)
@@ -820,9 +826,11 @@ millis_t next_lcd_update_ms;
     static uint16_t max_display_update_time = 0;
     millis_t ms = millis();
 
-  #ifdef LED_BACKLIGHT_TIMEOUT
-    leds.update_timeout(powersupply_on);
-  #endif
+    #ifdef LED_BACKLIGHT_TIMEOUT
+      leds.update_timeout(powersupply_on);
+    #endif
+
+    #if HAS_LCD_MENU
 
       // Handle any queued Move Axis motion
       manual_move.task();
@@ -841,26 +849,20 @@ millis_t next_lcd_update_ms;
         quick_feedback();                               //  - Always make a click sound
       };
 
-    auto do_click = [&]{
-      wait_for_unclick = true;                        //  - Set debounce flag to ignore continuous clicks
-      lcd_clicked = !wait_for_user;                   //  - Keep the click if not waiting for a user-click
-      wait_for_user = false;                          //  - Any click clears wait for user
-      quick_feedback();                               //  - Always make a click sound
-    };
-
-    #if HAS_TOUCH_BUTTONS
-      if (touch_buttons) {
-        reset_status_timeout(ms);
-        if (touch_buttons & (EN_A | EN_B)) {              // Menu arrows, in priority
-          if (ELAPSED(ms, next_button_update_ms)) {
-            encoderDiff = (ENCODER_STEPS_PER_MENU_ITEM) * epps * encoderDirection;
-            if (touch_buttons & EN_A) encoderDiff *= -1;
-            TERN_(AUTO_BED_LEVELING_UBL, external_encoder());
-            next_button_update_ms = ms + repeat_delay;    // Assume the repeat delay
-            if (!wait_for_unclick) {
-              next_button_update_ms += 250;               // Longer delay on first press
-              wait_for_unclick = true;                    // Avoid Back/Select click while repeating
-              chirp();
+      #if HAS_TOUCH_BUTTONS
+        if (touch_buttons) {
+          reset_status_timeout(ms);
+          if (touch_buttons & (EN_A | EN_B)) {              // Menu arrows, in priority
+            if (ELAPSED(ms, next_button_update_ms)) {
+              encoderDiff = (ENCODER_STEPS_PER_MENU_ITEM) * epps * encoderDirection;
+              if (touch_buttons & EN_A) encoderDiff *= -1;
+              TERN_(AUTO_BED_LEVELING_UBL, external_encoder());
+              next_button_update_ms = ms + repeat_delay;    // Assume the repeat delay
+              if (!wait_for_unclick) {
+                next_button_update_ms += 250;               // Longer delay on first press
+                wait_for_unclick = true;                    // Avoid Back/Select click while repeating
+                chirp();
+              }
             }
           }
           else if (!wait_for_unclick && (buttons & EN_C))   // OK button, if not waiting for a debounce release:
@@ -906,8 +908,7 @@ millis_t next_lcd_update_ms;
         if (TERN0(IS_RRW_KEYPAD, handle_keypad()))
           reset_status_timeout(ms);
 
-      if (TERN0(IS_RRW_KEYPAD, handle_keypad()))
-        reset_status_timeout(ms);
+        uint8_t abs_diff = ABS(encoderDiff);
 
         #if ENCODER_PULSES_PER_STEP > 1
           // When reversing the encoder direction, a movement step can be missed because
@@ -980,7 +981,7 @@ millis_t next_lcd_update_ms;
           #endif
         }
 
-        reset_status_timeout(ms);
+      #endif
 
       // This runs every ~100ms when idling often enough.
       // Instead of tracking changes just redraw the Status Screen once per second.
@@ -1004,16 +1005,7 @@ millis_t next_lcd_update_ms;
       // Then we want to use only 50% of the time
       const uint16_t bbr2 = planner.block_buffer_runtime() >> 1;
 
-    #if BOTH(HAS_LCD_MENU, SCROLL_LONG_FILENAMES)
-      // If scrolling of long file names is enabled and we are in the sd card menu,
-      // cause a refresh to occur until all the text has scrolled into view.
-      if (currentScreen == menu_media && !lcd_status_update_delay--) {
-        lcd_status_update_delay = ++filename_scroll_pos >= filename_scroll_max ? 12 : 4; // Long delay at end and start
-        if (filename_scroll_pos > filename_scroll_max) filename_scroll_pos = 0;
-        refresh(LCDVIEW_REDRAW_NOW);
-        reset_status_timeout(ms);
-      }
-    #endif
+      if ((should_draw() || drawing_screen) && (!bbr2 || bbr2 > max_display_update_time)) {
 
         // Change state of drawing flag between screen updates
         if (!drawing_screen) switch (lcdDrawUpdate) {
@@ -1097,13 +1089,8 @@ millis_t next_lcd_update_ms;
 
     } // ELAPSED(ms, next_lcd_update_ms)
 
-    #if SCREENS_CAN_TIME_OUT
-      // Return to Status Screen after a timeout
-      if (on_status_screen() || defer_return_to_status)
-        reset_status_timeout(ms);
-      else if (ELAPSED(ms, return_to_status_ms))
-        return_to_status();
-    #endif
+    TERN_(HAS_GRAPHICAL_TFT, tft_idle());
+  }
 
   #if HAS_ADC_BUTTONS
 
